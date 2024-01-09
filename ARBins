@@ -1,0 +1,242 @@
+from keybert import KeyBERT
+from xml.sax.saxutils import unescape
+from w3lib.html import remove_tags
+import json
+from tqdm import tqdm
+from transformers import GPT2Tokenizer
+
+def extract_keywords(lines, model):
+    rate = 1
+    topk = 3
+    keywords = []
+    for line in tqdm(lines):
+        sent = remove_tags(unescape(line))
+        kws_scores = model.extract_keywords(sent, keyphrase_ngram_range=(1,1), top_n=512)
+        # kws_scores = kws_scores[:int(rate*len(kws_scores))]
+        kws_scores = kws_scores[:topk]
+        kws = [k_s[0] for k_s in kws_scores]
+        keywords.append(kws)
+
+    return keywords
+
+def load_dataset():
+    imdb_dataset = [{'sent':[]} for i in range(2)]
+    ag_dataset = [{'sent':[]} for i in range(4)]
+    toxic_dataset = [{'sent':[]} for i in range(2)]
+    with open('./data/IMDb.txt', 'r') as f:
+        for line in f.readlines():
+            line = json.loads(line)
+            label = int(line[0])
+            sent = line[1].strip()
+            imdb_dataset[label]['sent'].append(sent)
+
+    with open('./data/Toxic.txt', 'r') as f:
+        for line in f.readlines():
+            line = json.loads(line)
+            label = int(line[0])
+            sent = line[1].strip()
+            toxic_dataset[label]['sent'].append(sent)
+
+    with open('./data/AG-data.txt', 'r') as f:
+        for line in f.readlines():
+            line = json.loads(line)
+            label = int(line[0])
+            sent = line[1].strip()
+            ag_dataset[label]['sent'].append(sent)
+
+    return imdb_dataset, ag_dataset, toxic_dataset
+
+def data_processing():
+    model = KeyBERT(model="./saved_model/")
+    # model = KeyBERT(model="./multicontrol/pretrained_model/bert-base-uncased")
+    imdb_dataset, ag_dataset, toxic_dataset = load_dataset()
+    data = {
+        0: extract_keywords(imdb_dataset[0]['sent'] , model),
+        1: extract_keywords(imdb_dataset[1]['sent'] , model),
+        2: extract_keywords(ag_dataset[0]['sent'] , model),
+        3: extract_keywords(ag_dataset[1]['sent'] , model),
+        4: extract_keywords(ag_dataset[2]['sent'] , model),
+        5: extract_keywords(ag_dataset[3]['sent'] , model),
+        # 6: extract_keywords(toxic_dataset[1]['sent'] , model),
+    }
+    for i in range(6):
+        data[i] = list(set(sum(data[i], [])))
+
+    save_json('./attr2keywords_top3.json', data)
+
+def read_json(file):
+    with open(file=file, mode='r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    return data
+
+def save_json(file, data):
+    with open(file=file, mode='w', encoding='utf-8') as f:
+        fd = json.dumps(data, ensure_ascii=False)
+        f.write(fd)
+
+import random
+
+def make_bins_(attr_keyword_list, bn=4, shuffle=True):
+    bins = {_:[] for _ in range(bn)}
+    for word_list in attr_keyword_list:
+        if shuffle:
+            random.shuffle(word_list)
+        step = int(len(word_list)/bn)
+        tmp = [word_list[i:i+step] for i in range(0, len(word_list), step)]
+        for i in range(bn):
+            bins[i] += tmp[i]
+
+    for i in range(bn):
+        bins[i] = list(set(bins[i]))
+
+    return bins
+
+def make_bins(attr_keyword_list, bn=4, shuffle=True):
+    bins = {_:[] for _ in range(bn)}
+    for word_list in attr_keyword_list:
+        if shuffle:
+            random.shuffle(word_list)
+        tokens_per_bin = len(word_list)/bn
+        tmp = [word_list[int(i*tokens_per_bin):int((i+1)*tokens_per_bin)] for i in range(bn)]
+        for i in range(bn):
+            bins[i] += tmp[i]
+
+    for i in range(bn):
+        bins[i] = list(set(bins[i]))
+
+    return bins
+
+def make_group(data):
+    new_data = {}
+    for i in range(6):
+        new_data[i] = [data[str(i)]]
+
+    c = len(new_data.keys())
+    for i in range(2):
+        for j in range(4):
+            new_data[c] = [data[str(i%2)],data[str(j%4+2)]]
+            c += 1
+    
+    # for i in range(2):
+    #     new_data[c] = [data[str(i%2)],data['6']]
+    #     c += 1
+    
+    # for i in range(4):
+    #     new_data[c] = [data[str(i%4+2)], data['6']]
+    #     c += 1
+
+    # for i in range(2):
+    #     for j in range(4):
+    #         new_data[c] = [data[str(i%2)], data[str(j%4+2)],data['6']]
+    #         c += 1
+
+    return new_data
+
+def construct_stego_bins(data, bn=4):
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained("./multicontrol/pretrained_model/gpt2-medium")
+    comm_tokens = decoder_tokenizer.all_special_tokens + list(ENGLISH_STOP_WORDS)
+    stego_bins = {}
+    non_keyword_tokens = set(range(decoder_tokenizer.vocab_size))
+    # non_keyword_tokens = set(load_vocab(file='./all_tokens.txt'))
+    # get non_keywords
+    for i in range(6):
+        keywords_tokens = list(filter(lambda x: len(x)==1,decoder_tokenizer(data[i][0]).input_ids))
+        keywords_tokens = set(sum(keywords_tokens, []))
+        non_keyword_tokens = non_keyword_tokens - keywords_tokens
+    
+    for i in range(14):
+        token_bins = {}
+        bins = make_bins(data[i], bn=bn, shuffle=True)
+        for j in range(bn):
+            token_bins[j] = list(set(sum(decoder_tokenizer(bins[j] + comm_tokens).input_ids, [])))
+
+        non_keyword_tokens_bins = make_bins([list(non_keyword_tokens)], bn=bn, shuffle=True)
+        for j in range(bn):
+            token_bins[j] += non_keyword_tokens_bins[j]
+
+        stego_bins[i] = token_bins
+        
+    return stego_bins
+
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+# 词频统计
+def count_words(sents):
+    count = CountVectorizer(
+        ngram_range=(1,1),
+        stop_words=None,
+        min_df=1,
+        vocabulary=None,
+        lowercase=False,
+    ).fit(sents)
+    words = count.get_feature_names_out()
+
+    return words
+
+def load_vocab(file=None):
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained("./multicontrol/pretrained_model/gpt2-medium")
+    if file:
+        vocab = [int(i) for i in read_txt(file)]
+    else:
+        vocab = list(range(decoder_tokenizer.vocab_size))
+
+    return vocab
+
+# 保存文件
+def save_txt(file, lines):
+    with open(file=file, mode='w', encoding='utf-8') as f:
+        for line in lines:
+            f.write(str(line))
+            f.write('\n')
+
+# 读取文件
+def read_txt(file):
+    lines = []
+    with open(file=file, mode='r', encoding='utf-8') as f:
+        line = f.readline().strip()
+        while True:
+            if line:
+                lines.append(line)
+                line = f.readline().strip()
+            else:
+                break
+    return lines
+
+def get_all_tokens():
+    imdb_dataset, ag_dataset, toxic_dataset = load_dataset()
+    sents = []
+    for _ in range(2):
+        sents += imdb_dataset[_]['sent']
+
+    for _ in range(4):
+        sents += ag_dataset[_]['sent']
+
+    sents += toxic_dataset[1]['sent']
+
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained("./multicontrol/pretrained_model/gpt2-medium")
+    all_tokens = decoder_tokenizer(sents).input_ids
+    all_tokens = sum(all_tokens, [])
+    all_tokens = list(set(all_tokens))
+    all_tokens = sorted(all_tokens)
+    save_txt('./all_tokens.txt', all_tokens)
+    print(len(all_tokens))
+
+def construct_com_bins(bn):
+    stego_bins = {}
+    decoder_tokenizer = GPT2Tokenizer.from_pretrained("./multicontrol/pretrained_model/gpt2-medium")
+    vocab_tokens = list(range(decoder_tokenizer.vocab_size))
+    comm_tokens = decoder_tokenizer.all_special_tokens + list(ENGLISH_STOP_WORDS)
+    stego_bins = make_bins([vocab_tokens], bn=bn, shuffle=True)
+    comm_token_ids = sum(decoder_tokenizer(comm_tokens).input_ids, [])
+    for i in range(bn):
+        stego_bins[i] += comm_token_ids
+
+    return stego_bins
+
+if __name__=='__main__':
+    data_processing()
+    data = read_json('./attr2keywords_top1.json')
+    new_data = make_group(data)
+    stego_bins = construct_stego_bins(new_data, bn=2**k)
